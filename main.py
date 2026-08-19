@@ -3,16 +3,11 @@ import logging
 import os
 import time
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
-import requests
-
+import httpx
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright
 
-
-# ============================================================
-# Configuration
-# ============================================================
 
 load_dotenv()
 
@@ -21,17 +16,10 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 TARGET_SIZE = "28.5"
 PRODUCT_NAME = "Onitsuka Tiger Mexico 66 Black/White"
-
-CHECK_INTERVAL = int(
-    os.getenv("CHECK_INTERVAL", "300")
-)
-
+CHECK_INTERVAL = max(int(os.getenv("CHECK_INTERVAL", "900")), 300)
+MAX_ATTEMPTS = 3
+RETRY_DELAYS = (5, 15)
 STATE_FILE = Path("state.json")
-
-
-# ============================================================
-# Logging
-# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,386 +27,185 @@ logging.basicConfig(
 )
 
 
-# ============================================================
-# Persistent state
-# ============================================================
-
-def load_state() -> bool:
-    """Load the previous stock state."""
-
+def load_state():
     if not STATE_FILE.exists():
-        return False
+        return None
 
     try:
-        data = json.loads(
-            STATE_FILE.read_text()
-        )
-
-        return bool(
-            data.get("in_stock", False)
-        )
-
+        value = json.loads(STATE_FILE.read_text()).get("in_stock")
     except (json.JSONDecodeError, OSError):
-        return False
+        return None
+
+    return value if isinstance(value, bool) else None
 
 
-def save_state(in_stock: bool) -> None:
-    """Save the current stock state."""
-
-    STATE_FILE.write_text(
-        json.dumps(
-            {
-                "in_stock": in_stock
-            },
-            indent=2,
-        )
-    )
+def save_state(in_stock):
+    STATE_FILE.write_text(json.dumps({"in_stock": in_stock}))
 
 
-# ============================================================
-# Discord
-# ============================================================
+def product_sku(product_url):
+    filename = Path(urlsplit(product_url).path).stem
+    if not filename:
+        raise ValueError("PRODUCT_URL does not contain a product SKU.")
+    return filename.upper()
 
-def send_discord_notification() -> None:
-    """Send a restock notification to Discord."""
 
+def stock_endpoint(product_url):
+    parts = urlsplit(product_url)
+    path_parts = parts.path.strip("/").split("/")
+
+    if len(path_parts) < 3 or path_parts[2] != "product":
+        raise ValueError("PRODUCT_URL is not an Onitsuka product-page URL.")
+
+    path = f"/{path_parts[0]}/{path_parts[1]}/mobilestock/index/stock"
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def retry_delay(response, attempt):
+    if response is not None and response.status_code == 429:
+        try:
+            return max(float(response.headers.get("Retry-After", "0")), 60)
+        except ValueError:
+            return 60
+
+    return RETRY_DELAYS[attempt]
+
+
+def check_stock(product_url, target_size, client=None):
+    """Return True, False, or None when the response cannot be trusted."""
+    if client is None:
+        timeout = httpx.Timeout(20, connect=10)
+        with httpx.Client(timeout=timeout, follow_redirects=True) as temporary_client:
+            return check_stock(product_url, target_size, temporary_client)
+
+    sku = f"{product_sku(product_url)}_{target_size}"
+    endpoint = stock_endpoint(product_url)
+    headers = {
+        "Accept": "application/json",
+        "Referer": product_url,
+        "User-Agent": "mexico66-watcher/1.0",
+    }
+
+    for attempt in range(MAX_ATTEMPTS):
+        response = None
+        try:
+            response = client.get(
+                endpoint,
+                params={"isAjax": "1", "skus": sku},
+                headers=headers,
+            )
+
+            if response.is_success:
+                stock = response.json().get("stock", {}).get(sku)
+                value = stock.get("value") if isinstance(stock, dict) else None
+
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    logging.warning("Stock response did not contain a numeric value for %s.", sku)
+                    return None
+
+                logging.info("%s reports inventory value %s for %s.", endpoint, value, sku)
+                return value > 0
+
+            if response.status_code not in (429, 500, 502, 503, 504):
+                logging.warning("Stock endpoint returned HTTP %s.", response.status_code)
+                return None
+
+            logging.warning(
+                "Stock endpoint returned HTTP %s (attempt %s/%s).",
+                response.status_code,
+                attempt + 1,
+                MAX_ATTEMPTS,
+            )
+        except (httpx.HTTPError, ValueError, TypeError) as error:
+            logging.warning(
+                "Stock request failed (attempt %s/%s): %s",
+                attempt + 1,
+                MAX_ATTEMPTS,
+                error,
+            )
+
+        if attempt < MAX_ATTEMPTS - 1:
+            delay = retry_delay(response, attempt)
+            logging.info("Retrying stock request in %s seconds.", delay)
+            time.sleep(delay)
+
+    return None
+
+
+def send_notification(client):
     payload = {
         "content": (
-            "🚨 **RESTOCK ALERT** 🚨\n\n"
+            f"@everyone"
+            "**RESTOCK ALERT**\n\n"
             f"**{PRODUCT_NAME}**\n"
             f"Size **{TARGET_SIZE} cm** is back in stock!\n\n"
             f"{PRODUCT_URL}"
         )
     }
 
-    response = requests.post(
-        DISCORD_WEBHOOK_URL,
-        json=payload,
-        timeout=15,
-    )
-
-    response.raise_for_status()
-
-    logging.info(
-        "Discord notification sent successfully."
-    )
-
-
-# ============================================================
-# Stock detection
-# ============================================================
-
-def check_stock(page) -> bool:
-    """
-    Check whether size 28.5 appears to be available.
-    """
-
-    logging.info(
-        "Opening product page..."
-    )
-
-    page.goto(
-        PRODUCT_URL,
-        wait_until="domcontentloaded",
-        timeout=60_000,
-    )
-
-    # Give JavaScript time to render the product.
-    page.wait_for_timeout(3_000)
-
-    logging.info(
-        "Looking for size %s...",
-        TARGET_SIZE,
-    )
-
-    elements = page.locator(
-        "button, "
-        "label, "
-        "[role='button'], "
-        "option, "
-        "input"
-    )
-
-    for i in range(elements.count()):
-
-        element = elements.nth(i)
-
+    for attempt in range(MAX_ATTEMPTS):
+        response = None
         try:
-
-            if not element.is_visible():
-                continue
-
-            text = (
-                element.inner_text()
-                .strip()
-                .lower()
+            response = client.post(DISCORD_WEBHOOK_URL, json=payload)
+            response.raise_for_status()
+            logging.info("Discord notification sent.")
+            return
+        except httpx.HTTPError as error:
+            logging.warning(
+                "Discord notification failed (attempt %s/%s): %s",
+                attempt + 1,
+                MAX_ATTEMPTS,
+                error,
             )
 
-            value = (
-                element.get_attribute("value")
-                or ""
-            ).strip().lower()
+        if attempt < MAX_ATTEMPTS - 1:
+            delay = retry_delay(response, attempt)
+            logging.info("Retrying Discord notification in %s seconds.", delay)
+            time.sleep(delay)
 
-            aria_label = (
-                element.get_attribute(
-                    "aria-label"
-                )
-                or ""
-            ).strip().lower()
-
-            class_name = (
-                element.get_attribute("class")
-                or ""
-            ).lower()
-
-            combined = " ".join(
-                [
-                    text,
-                    value,
-                    aria_label,
-                ]
-            )
-
-            # Is this the 28.5 size?
-            if TARGET_SIZE not in combined:
-                continue
-
-            logging.info(
-                "Found size element: %r",
-                combined,
-            )
-
-            # ----------------------------------------------
-            # Disabled checks
-            # ----------------------------------------------
-
-            if element.is_disabled():
-
-                logging.info(
-                    "Size %s is disabled.",
-                    TARGET_SIZE,
-                )
-
-                return False
-
-            if (
-                element.get_attribute(
-                    "disabled"
-                )
-                is not None
-            ):
-
-                logging.info(
-                    "Size %s has disabled attribute.",
-                    TARGET_SIZE,
-                )
-
-                return False
-
-            if (
-                element.get_attribute(
-                    "aria-disabled"
-                )
-                == "true"
-            ):
-
-                logging.info(
-                    "Size %s is aria-disabled.",
-                    TARGET_SIZE,
-                )
-
-                return False
-
-            # ----------------------------------------------
-            # Common unavailable classes
-            # ----------------------------------------------
-
-            unavailable_classes = [
-                "disabled",
-                "unavailable",
-                "out-of-stock",
-                "outofstock",
-                "sold-out",
-                "soldout",
-            ]
-
-            if any(
-                word in class_name
-                for word in unavailable_classes
-            ):
-
-                logging.info(
-                    "Size %s appears unavailable.",
-                    TARGET_SIZE,
-                )
-
-                return False
-
-            # If the size exists and isn't disabled,
-            # consider it available.
-
-            logging.info(
-                "🎉 Size %s appears AVAILABLE!",
-                TARGET_SIZE,
-            )
-
-            return True
-
-        except Exception:
-            # The page can change while we're examining it.
-            continue
-
-    logging.warning(
-        "Could not determine availability for size %s.",
-        TARGET_SIZE,
-    )
-
-    return False
+    raise RuntimeError("Discord notification could not be sent.")
 
 
-# ============================================================
-# Configuration validation
-# ============================================================
+def apply_stock_result(previous_stock, current_stock, client, notify=send_notification, persist=save_state):
+    """Persist a known result and notify only for an out-of-stock to in-stock transition."""
+    if current_stock is None:
+        return previous_stock
 
-def validate_config() -> None:
+    if previous_stock is False and current_stock is True:
+        logging.info("Restock detected.")
+        notify(client)
 
-    required = {
-        "PRODUCT_URL": PRODUCT_URL,
-        "DISCORD_WEBHOOK_URL": DISCORD_WEBHOOK_URL,
-    }
-
-    missing = [
-        name
-        for name, value in required.items()
-        if not value
-    ]
-
-    if missing:
-
-        raise RuntimeError(
-            "Missing environment variables:\n"
-            + "\n".join(
-                f"  - {name}"
-                for name in missing
-            )
-        )
+    persist(current_stock)
+    return current_stock
 
 
-# ============================================================
-# Main watcher
-# ============================================================
-
-def main() -> None:
-
-    validate_config()
+def main():
+    if not PRODUCT_URL or not DISCORD_WEBHOOK_URL:
+        raise RuntimeError("PRODUCT_URL and DISCORD_WEBHOOK_URL must be set.")
 
     previous_stock = load_state()
+    timeout = httpx.Timeout(20, connect=10)
 
-    logging.info("=" * 60)
-    logging.info(
-        "Onitsuka Tiger Stock Watcher"
-    )
-    logging.info("=" * 60)
-    logging.info(
-        "Product: %s",
-        PRODUCT_NAME,
-    )
-    logging.info(
-        "Size: %s cm",
-        TARGET_SIZE,
-    )
-    logging.info(
-        "Check interval: %s seconds",
-        CHECK_INTERVAL,
-    )
-    logging.info("=" * 60)
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        while True:
+            try:
+                current_stock = check_stock(PRODUCT_URL, TARGET_SIZE, client)
 
-    with sync_playwright() as playwright:
-
-        browser = playwright.chromium.launch(
-            headless=True
-        )
-
-        page = browser.new_page()
-
-        try:
-
-            while True:
-
-                try:
-
-                    logging.info(
-                        "Checking stock..."
+                if current_stock is None:
+                    logging.warning("Could not determine stock; saved state is unchanged.")
+                else:
+                    status = "IN STOCK" if current_stock else "OUT OF STOCK"
+                    logging.info("%s | Size %s | %s", PRODUCT_NAME, TARGET_SIZE, status)
+                    previous_stock = apply_stock_result(
+                        previous_stock,
+                        current_stock,
+                        client,
                     )
+            except Exception:
+                logging.exception("Stock check failed; saved state is unchanged.")
 
-                    current_stock = check_stock(
-                        page
-                    )
-
-                    status = (
-                        "IN STOCK"
-                        if current_stock
-                        else "OUT OF STOCK"
-                    )
-
-                    logging.info(
-                        "Mexico 66 Black/White | "
-                        "Size %s | %s",
-                        TARGET_SIZE,
-                        status,
-                    )
-
-                    # --------------------------------------
-                    # Restock detection
-                    # --------------------------------------
-                    #
-                    # Only send a notification when:
-                    #
-                    # OUT OF STOCK
-                    #       ↓
-                    #   IN STOCK
-                    #
-                    # This prevents repeated Discord
-                    # notifications every 5 minutes.
-                    # --------------------------------------
-
-                    if (
-                        current_stock
-                        and not previous_stock
-                    ):
-
-                        logging.info(
-                            "🚨 RESTOCK DETECTED!"
-                        )
-
-                        send_discord_notification()
-
-                    save_state(
-                        current_stock
-                    )
-
-                    previous_stock = (
-                        current_stock
-                    )
-
-                except Exception:
-
-                    logging.exception(
-                        "Error while checking stock."
-                    )
-
-                logging.info(
-                    "Next check in %s seconds...",
-                    CHECK_INTERVAL,
-                )
-
-                time.sleep(
-                    CHECK_INTERVAL
-                )
-
-        finally:
-
-            browser.close()
+            logging.info("Checking again in %s seconds.", CHECK_INTERVAL)
+            time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
