@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 import requests
+
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
