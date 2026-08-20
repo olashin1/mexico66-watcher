@@ -4,6 +4,14 @@
 
 A lightweight stock monitoring service for Onitsuka Tiger Mexico 66 shoes that automatically checks product availability and sends Discord notifications when stock changes.
 
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
+![pip](https://img.shields.io/badge/pip-3775A9?logo=pypi&logoColor=white)
+[![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=fff)](#)
+[![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?&logo=discord&logoColor=white)](#)
+[![Git](https://img.shields.io/badge/Git-F05032?logo=git&logoColor=fff)](#)
+![Google Cloud](https://img.shields.io/badge/Google_Cloud-4285F4?logo=googlecloud&logoColor=white)
+![Ubuntu](https://img.shields.io/badge/Ubuntu-E95420?logo=ubuntu&logoColor=white)
+
 </div>
 
 ## Overview
@@ -34,15 +42,12 @@ python -m pip install -r requirements.txt
 
 The watcher sends stock notifications to a Discord text channel using a webhook.
 
-To create one:
-
 1. Open your Discord server.
-2. Go to **Server Settings**.
-3. Select **Integrations**.
-4. Open **Webhooks** and select **New Webhook**.
-5. Choose the text channel where you want stock notifications to appear.
-6. Copy the webhook URL.
-7. Add the URL to your `.env` file as `DISCORD_WEBHOOK_URL`.
+2. Go to **Server Settings → Integrations → Webhooks**.
+3. Select **New Webhook**.
+4. Choose the text channel where you want stock notifications to appear.
+5. Copy the webhook URL.
+6. Add the URL to your `.env` file as `DISCORD_WEBHOOK_URL`.
 
 Keep the webhook URL private, as anyone with access to it can send messages to the configured channel.
 
